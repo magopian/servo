@@ -33,7 +33,7 @@ use util::mem::HeapSizeOf;
 use util::opts;
 
 struct LocalLayoutContext {
-    font_context: RefCell<FontContext>,
+    font_context: Option<RefCell<FontContext>>,
     applicable_declarations_cache: RefCell<ApplicableDeclarationsCache>,
     style_sharing_candidate_cache: RefCell<StyleSharingCandidateCache>,
 }
@@ -41,7 +41,10 @@ struct LocalLayoutContext {
 impl HeapSizeOf for LocalLayoutContext {
     // FIXME(njn): measure other fields eventually.
     fn heap_size_of_children(&self) -> usize {
-        self.font_context.heap_size_of_children()
+        match self.font_context.as_ref() {
+            Some(fc) => fc.heap_size_of_children(),
+            None => 0,
+        }
     }
 }
 
@@ -63,9 +66,10 @@ fn create_or_get_local_context(shared_layout_context: &SharedLayoutContext)
             }
             context
         } else {
-            let font_cache_task = shared_layout_context.font_cache_task.lock().unwrap().clone();
+            let maybe_font_cache_task =
+                shared_layout_context.full.as_ref().map(|f| f.font_cache_task.lock().unwrap().clone());
             let context = Rc::new(LocalLayoutContext {
-                font_context: RefCell::new(FontContext::new(font_cache_task)),
+                font_context: maybe_font_cache_task.map(|t| RefCell::new(FontContext::new(t))),
                 applicable_declarations_cache: RefCell::new(ApplicableDeclarationsCache::new()),
                 style_sharing_candidate_cache: RefCell::new(StyleSharingCandidateCache::new()),
             });
@@ -81,30 +85,38 @@ pub struct StylistWrapper(pub *const Stylist);
 #[allow(unsafe_code)]
 unsafe impl Sync for StylistWrapper {}
 
-/// Layout information shared among all workers. This must be thread-safe.
-pub struct SharedLayoutContext {
+pub struct FullSharedLayoutContext {
     /// The shared image cache task.
     pub image_cache_task: ImageCacheTask,
 
     /// A channel for the image cache to send responses to.
     pub image_cache_sender: Mutex<ImageCacheChan>,
 
+    /// Interface to the font cache task.
+    pub font_cache_task: Mutex<FontCacheTask>,
+
+    /// The URL.
+    pub url: Url,
+
+    /// A channel to send canvas renderers to paint task, in order to correctly paint the layers
+    pub canvas_layers_sender: Mutex<Sender<(LayerId, IpcSender<CanvasMsg>)>>,
+
+    /// The visible rects for each layer, as reported to us by the compositor.
+    pub visible_rects: Arc<HashMap<LayerId, Rect<Au>, DefaultState<FnvHasher>>>,
+}
+
+/// Layout information shared among all workers. This must be thread-safe.
+pub struct SharedLayoutContext {
     /// The current viewport size.
     pub viewport_size: Size2D<Au>,
 
     /// Screen sized changed?
     pub screen_size_changed: bool,
 
-    /// Interface to the font cache task.
-    pub font_cache_task: Mutex<FontCacheTask>,
-
     /// The CSS selector stylist.
     ///
     /// FIXME(#2604): Make this no longer an unsafe pointer once we have fast `RWArc`s.
     pub stylist: StylistWrapper,
-
-    /// The URL.
-    pub url: Url,
 
     /// Starts at zero, and increased by one every time a layout completes.
     /// This can be used to easily check for invalid stale data.
@@ -114,11 +126,8 @@ pub struct SharedLayoutContext {
     /// sent.
     pub new_animations_sender: Mutex<Sender<Animation>>,
 
-    /// A channel to send canvas renderers to paint task, in order to correctly paint the layers
-    pub canvas_layers_sender: Mutex<Sender<(LayerId, IpcSender<CanvasMsg>)>>,
-
-    /// The visible rects for each layer, as reported to us by the compositor.
-    pub visible_rects: Arc<HashMap<LayerId, Rect<Au>, DefaultState<FnvHasher>>>,
+    /// Why is this reflow occurring
+    pub goal: ReflowGoal,
 
     /// The animations that are currently running.
     pub running_animations: Arc<RwLock<HashMap<OpaqueNode, Vec<Animation>>>>,
@@ -126,11 +135,16 @@ pub struct SharedLayoutContext {
     /// The list of animations that have expired since the last style recalculation.
     pub expired_animations: Arc<RwLock<HashMap<OpaqueNode, Vec<Animation>>>>,
 
-    /// Why is this reflow occurring
-    pub goal: ReflowGoal,
-
     ///The CSS error reporter for all CSS loaded in this layout thread
-    pub error_reporter: Box<ParseErrorReporter + Sync>
+    pub error_reporter: Box<ParseErrorReporter + Sync>,
+
+    /// Additional members that are only needed on full layout passes (as opposed to pure
+    /// restyle passes).
+    pub full: Option<FullSharedLayoutContext>,
+}
+
+impl SharedLayoutContext {
+    pub fn full(&self) -> &FullSharedLayoutContext { self.full.as_ref().unwrap() }
 }
 
 pub struct LayoutContext<'a> {
@@ -151,7 +165,7 @@ impl<'a> LayoutContext<'a> {
 
     #[inline(always)]
     pub fn font_context(&self) -> RefMut<FontContext> {
-        self.cached_local_layout_context.font_context.borrow_mut()
+        self.cached_local_layout_context.font_context.as_ref().unwrap().borrow_mut()
     }
 
     #[inline(always)]
@@ -167,8 +181,8 @@ impl<'a> LayoutContext<'a> {
     pub fn get_or_request_image(&self, url: Url, use_placeholder: UsePlaceholder)
                                 -> Option<Arc<Image>> {
         // See if the image is already available
-        let result = self.shared.image_cache_task.find_image(url.clone(),
-                                                             use_placeholder);
+        let result = self.shared.full().image_cache_task.find_image(url.clone(),
+                                                                    use_placeholder);
 
         match result {
             Ok(image) => Some(image),
@@ -184,9 +198,9 @@ impl<'a> LayoutContext<'a> {
                     // Not loaded, test mode - load the image synchronously
                     (_, true) => {
                         let (sync_tx, sync_rx) = ipc::channel().unwrap();
-                        self.shared.image_cache_task.request_image(url,
-                                                                   ImageCacheChan(sync_tx),
-                                                                   None);
+                        self.shared.full().image_cache_task.request_image(url,
+                                                                          ImageCacheChan(sync_tx),
+                                                                          None);
                         match sync_rx.recv().unwrap().image_response {
                             ImageResponse::Loaded(image) |
                             ImageResponse::PlaceholderLoaded(image) => Some(image),
@@ -195,8 +209,8 @@ impl<'a> LayoutContext<'a> {
                     }
                     // Not yet requested, async mode - request image from the cache
                     (ImageState::NotRequested, false) => {
-                        let sender = self.shared.image_cache_sender.lock().unwrap().clone();
-                        self.shared.image_cache_task.request_image(url, sender, None);
+                        let sender = self.shared.full().image_cache_sender.lock().unwrap().clone();
+                        self.shared.full().image_cache_task.request_image(url, sender, None);
                         None
                     }
                     // Image has been requested, is still pending. Return no image
