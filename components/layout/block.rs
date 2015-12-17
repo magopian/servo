@@ -1860,7 +1860,7 @@ impl Flow for BlockFlow {
         let stacking_relative_position_of_display_port_for_children =
             if is_stacking_context || self.is_root() {
                 let visible_rect =
-                    match layout_context.shared.visible_rects.get(&self.layer_id()) {
+                    match layout_context.shared.full().visible_rects.get(&self.layer_id()) {
                         Some(visible_rect) => *visible_rect,
                         None => Rect::new(Point2D::zero(), layout_context.shared.viewport_size),
                     };

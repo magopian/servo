@@ -1149,7 +1149,7 @@ impl FragmentDisplayListBuilding for Fragment {
                             let data = receiver.recv().unwrap();
 
                             // Propagate the layer and the renderer to the paint task.
-                            layout_context.shared.canvas_layers_sender.lock().unwrap().send(
+                            layout_context.shared.full().canvas_layers_sender.lock().unwrap().send(
                                 (layer_id, (*ipc_renderer).clone())).unwrap();
 
                             data
